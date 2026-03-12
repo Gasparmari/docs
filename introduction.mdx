@@ -1,0 +1,276 @@
+---
+title: "Introducción — FOTO_MULTAS"
+description: "Sistema AWS de procesamiento de multas de tránsito fotorradar. Qué hace, por qué existe, quiénes son los clientes y cómo está construido."
+icon: "camera"
+---
+
+## ¿Qué es FOTO_MULTAS?
+
+**FOTO_MULTAS** es un sistema de backend corriendo en AWS que, dado un número de patente vehicular (llamado _dominio_ en la Argentina) o un identificador fiscal/personal (CUIT o DNI), consulta una cascada de APIs externas para localizar los datos de contacto del titular del vehículo infractor. Los resultados se persisten en una base de datos Oracle compartida con los sistemas de gestión de los clientes.
+
+En términos simples: cuando un radar fotográfico registra una infracción de tránsito, el sistema necesita saber _a quién notificar_. FOTO_MULTAS es quien resuelve esa pregunta.
+
+<Info>
+  **Para nuevos integrantes:** Este sistema no captura imágenes de infracciones ni emite multas. Su función exclusiva es la **búsqueda y enriquecimiento de datos de titulares** para que los organismos de tránsito puedan notificar a los infractores.
+</Info>
+
+---
+
+## Clientes
+
+El sistema procesa multas para los siguientes organismos y jurisdicciones:
+
+<CardGroup cols={3}>
+  <Card title="Uruguay" icon="flag">
+    Pipeline independiente para datos de facturación electrónica de la DGI (Dirección General Impositiva de Uruguay). Proceso completamente separado del pipeline principal.
+  </Card>
+  <Card title="Mar del Plata" icon="city">
+    Municipio de General Pueyrredón, provincia de Buenos Aires. Uno de los principales clientes del pipeline de multas.
+  </Card>
+  <Card title="Berazategui" icon="building">
+    Municipio del conurbano bonaerense. Cuenta con su propia API de consulta integrada como etapa de la cascada de procesamiento.
+  </Card>
+  <Card title="Escobar" icon="building">
+    Municipio del norte del conurbano bonaerense. Integrado al pipeline principal de multas.
+  </Card>
+  <Card title="Santa Fe" icon="landmark">
+    Provincia de Santa Fe. La API de Santa Fe (StaFe) es el **punto de entrada principal** de la cascada de resolución de titulares.
+  </Card>
+  <Card title="Mendoza" icon="mountain">
+    Provincia de Mendoza. Integrada al pipeline principal de multas fotorradar.
+  </Card>
+</CardGroup>
+
+---
+
+## Glosario de términos del dominio
+
+Antes de revisar la arquitectura, es importante entender la terminología específica de este sistema y del contexto argentino:
+
+| Término | Significado |
+|---|---|
+| **Dominio** | Número de patente vehicular argentina (ej: `AB 123 CD`). Es la clave de búsqueda principal. |
+| **CUIT** | _Clave Única de Identificación Tributaria_. Identificador fiscal argentino para personas jurídicas (empresas) y personas físicas inscriptas. Formato: `XX-XXXXXXXX-X`. |
+| **DNI** | _Documento Nacional de Identidad_. Documento de identidad para personas físicas no inscriptas en el registro tributario. |
+| **Lote** | Conjunto de registros de multas agrupados para procesamiento en batch. Típicamente 20 registros por lote. |
+| **Multa pendiente** | Infracción registrada en Oracle con estado `PENDIENTE`, esperando ser procesada por el sistema. |
+| **Titular** | Propietario registrado del vehículo. El objetivo del sistema es localizar su información de contacto (teléfono, email). |
+| **BRN** | Prefijo de la tabla Oracle `BUC_RODADOS_NOVEDADES`, la tabla principal donde se guardan los resultados de cada búsqueda. |
+| **CLOUD\_RUN** | Variable de entorno que separa el ambiente de desarrollo (`false`) del productivo (`true`). En dev, sólo se escribe en el schema `DATOS_CLIENTES`; en prod, en `DATOS_PROD`. |
+
+---
+
+## ¿Qué problema resuelve?
+
+Cuando un radar fotográfico captura una infracción, el organismo de tránsito sólo tiene la imagen de la patente. Para notificar al titular necesita:
+
+1. **Identificar quién es el propietario** del vehículo a partir del dominio.
+2. **Obtener sus datos de contacto** (teléfono, email, domicilio).
+3. **Persistir esa información** para que el sistema de gestión de multas pueda emitir la notificación.
+
+El desafío es que ningún proveedor de datos tiene información completa para todos los vehículos. Por eso el sistema implementa una **cascada de APIs**: si el primer proveedor no encuentra al titular, se consulta el siguiente, y así sucesivamente hasta agotar todas las fuentes disponibles.
+
+---
+
+## Pipelines del sistema
+
+FOTO_MULTAS contiene **dos pipelines independientes** que comparten el mismo cluster de AWS ECS:
+
+<CardGroup cols={2}>
+  <Card title="Pipeline de Multas de Tránsito" icon="car" color="#16A34A">
+    **Pipeline principal.** Procesa multas de fotorradar argentinas consultando APIs como StaFe, SIJAI, Peype, InfoExpertos, Córdoba, Berazategui y Agildata en cascada. Escribe los resultados en Oracle.
+
+    Tiene dos sub-flujos:
+    - **Automático programado**: corre 8 veces por día vía EventBridge.
+    - **On-demand por operador**: un operador sube un archivo `.txt` o `.xlsx` a S3 y el sistema lo procesa automáticamente.
+  </Card>
+  <Card title="Pipeline DGI Uruguay" icon="file-invoice" color="#2563EB">
+    **Pipeline independiente.** Procesa datos de facturación electrónica del organismo tributario uruguayo (DGI). Lee credenciales desde Google Drive, usa Selenium para navegar el portal de eFactura del DGI, y guarda los resultados en Google Drive.
+
+    No escribe en Oracle. No interactúa con el pipeline de multas. Se activa de forma manual o mediante n8n.
+  </Card>
+</CardGroup>
+
+---
+
+## Stack tecnológico
+
+### Python
+
+Lenguaje único de toda la lógica de negocio. Se eligió Python por su ecosistema de datos (pandas, awswrangler), su velocidad de desarrollo, y la disponibilidad de SDKs maduros para AWS (boto3), Oracle (oracledb) y scraping (Selenium, BeautifulSoup).
+
+Versión mínima: **Python 3.12** en Lambdas; **Python 3.13** en containers ECS.
+
+### Docker + AWS ECR
+
+Cada servicio ECS es una imagen Docker independiente publicada en **ECR** (Elastic Container Registry, el registro privado de imágenes de AWS). Docker garantiza que el mismo código que corre en desarrollo corra idénticamente en producción, con todas sus dependencias (Oracle client, Chrome para Selenium, etc.) ya incluidas.
+
+### AWS ECS (Elastic Container Service)
+
+Orquestador de containers Docker en AWS. Permite ejecutar tareas batch bajo demanda sin mantener servidores permanentes. El sistema usa dos modos de lanzamiento:
+
+- **FARGATE**: serverless. AWS gestiona el hardware. Se usa para tareas que no necesitan IP fija ni VPN (ej: `ecs_processor`).
+- **EC2**: dos instancias `t3.small` siempre encendidas y registradas al cluster. Se usan para tareas que requieren VPN (NET\_ADMIN) o IP fija para que los proveedores externos puedan whitelist-ear las llamadas (ej: consultas a InfoExpertos).
+
+### AWS Lambda
+
+Funciones serverless de corta duración que actúan como **disparadores** de tareas ECS. Ninguna lógica de negocio vive en Lambda; sólo coordinan el lanzamiento de containers y registran eventos en DynamoDB. Se eligió este patrón porque las tareas de procesamiento pueden durar más de 15 minutos (límite de Lambda).
+
+### AWS S3
+
+Almacenamiento de objetos usado para dos propósitos:
+1. **Bucket de uploads** (`${env}-foto-multas-uploads`): los operadores suben archivos `.txt`/`.xlsx` con listados de CUITs, DNIs o dominios. S3 emite un evento que dispara automáticamente el procesamiento.
+2. **Bucket de lotes** (`scrapping-ros`): los batches JSON de multas pendientes se escriben aquí durante el procesamiento programado, actuando como buffer entre etapas del pipeline.
+
+### AWS DynamoDB
+
+Base de datos NoSQL usada para:
+- **Cola de handoff entre etapas**: la tabla `foto-multas-apistafe-not-found` almacena los dominios que la primera etapa no pudo resolver, para que la segunda etapa los reintente.
+- **Caché de resultados de APIs**: evita llamar dos veces al mismo proveedor por el mismo CUIT/dominio (tablas por proveedor con TTL de 90 días).
+- **Control de ciclo de vida de lotes**: las tablas `scrapping-patentes-processor-batch` y `scrapping-patentes-extractor` rastrean el estado de cada lote (PENDING → PROCESSING → completado).
+
+### AWS EventBridge
+
+Servicio de scheduling (equivalente a cron en AWS). Dispara Lambdas de lanzamiento en horarios fijos. Por ejemplo, el pipeline principal corre 8 veces por día en horarios del tipo 22:30, 03:30, 05:30 (hora argentina).
+
+### AWS SSM Parameter Store
+
+Almacén seguro de secretos y configuraciones (API keys, credenciales de SFTP, cadenas de conexión a Oracle). Los containers leen sus credenciales desde SSM al iniciarse, sin que ningún secreto quede hardcodeado en el código o en las imágenes Docker.
+
+### Oracle Database
+
+Base de datos relacional central del negocio. Es el sistema de registro (_system of record_) del ecosistema de multas. FOTO_MULTAS **lee** las multas pendientes de Oracle y **escribe** los datos de titulares encontrados. Se conecta usando AWS Glue como proxy de credenciales.
+
+- Schema de desarrollo: `DATOS_CLIENTES`
+- Schema de producción: `DATOS_PROD`
+
+### AWS CloudWatch
+
+Servicio de logs y monitoreo. Todos los containers ECS y Lambdas escriben sus logs en CloudWatch con retención de 7 días. Permite hacer debugging y seguimiento de ejecuciones históricas.
+
+### AWS SNS (Simple Notification Service)
+
+Servicio de notificaciones. El sistema envía emails automáticos al equipo cuando:
+- Una ejecución inicia o finaliza (pipeline DGI Uruguay).
+- Ocurre un error crítico (ej: StaFe API caída por 10 llamadas consecutivas fallidas).
+
+### Terraform
+
+Herramienta de Infrastructure as Code (IaC). Toda la infraestructura AWS (ECS, Lambda, S3, DynamoDB, EventBridge, SNS, IAM) está definida en archivos `.tf` bajo el directorio `terraform/`. Esto permite reproducir o modificar la infraestructura de forma controlada y versionada.
+
+Hay dos ambientes gestionados por Terraform:
+
+| Ambiente | Variable `environment` | Schema Oracle |
+|---|---|---|
+| Desarrollo | `desa` | `DATOS_CLIENTES` |
+| Producción | `prod` | `DATOS_PROD` |
+
+---
+
+## Arquitectura de alto nivel
+
+El siguiente diagrama muestra cómo se relacionan los componentes principales del sistema:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  PIPELINE DE MULTAS DE TRÁNSITO                                     │
+│                                                                     │
+│  Flujo A — Procesamiento programado (principal)                     │
+│  ─────────────────────────────────────────────                      │
+│  EventBridge (cron, 8x/día)                                         │
+│      └─ Lambda launcher ──► ECS Task (Stage 1)                     │
+│                                  ├─ Oracle → extrae multas PENDIENTE│
+│                                  ├─ StaFe API → SIJAI → Peype       │
+│                                  ├─ Encontrado → Oracle             │
+│                                  └─ No encontrado → DynamoDB queue  │
+│                                                      │              │
+│  EventBridge (cada hora :45)                         │              │
+│      └─ Lambda launcher ──► ECS Task (Stage 2) ◄────┘              │
+│                                  ├─ Lee DynamoDB queue              │
+│                                  ├─ Córdoba → Peype → InfoExpertos  │
+│                                  ├─ Berazategui → Agildata          │
+│                                  └─ Encontrado → Oracle             │
+│                                                                     │
+│  Flujo B — On-demand por operador                                   │
+│  ────────────────────────────────                                   │
+│  Operador sube .txt/.xlsx                                           │
+│      └─ S3 evento ──► Lambda trigger ──► ECS Task (FARGATE)        │
+│                                              └─ Peype / InfoExpertos│
+│                                                 / CUIT Online / etc.│
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│  PIPELINE DGI URUGUAY (independiente)                               │
+│                                                                     │
+│  n8n / manual                                                       │
+│      └─ ECS Orchestrator (FARGATE)                                  │
+│              ├─ Lee credenciales RUT desde Google Drive             │
+│              └─ Por cada RUT: Lambda worker (Selenium + Chrome)     │
+│                      └─ Navega portal DGI → guarda en Google Drive  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Servicios ECS del repositorio
+
+| Servicio | Descripción | Trigger |
+|---|---|---|
+| `ecs_processor` | Procesador multi-modo on-demand. Maneja Peype, InfoExpertos, CUIT Online, scrapings, reprocesos. | S3 upload → Lambda |
+| `ecs_dedicated` | Etapa 1 del pipeline principal. Consulta StaFe, SIJAI y Peype. | EventBridge cron |
+| `ecs_decoupled` | Etapa 2 del pipeline principal. Consulta Córdoba, Peype, InfoExpertos, Berazategui, Agildata sobre los dominios que Stage 1 no pudo resolver. | EventBridge cron |
+| `ecs_gestor` | Procesador legacy monolítico. **Deshabilitado** en producción. Se mantiene como referencia y para ejecución manual de emergencia. | Manual (EventBridge deshabilitado) |
+| `ecs_orchestrator_dgi` | Orquestador del pipeline DGI Uruguay. | Manual / n8n |
+| `ecs_peype_sftp` | Enriquecimiento batch de contactos vía SFTP con Peype. Alternativa asíncrona a la API en tiempo real. | Manual |
+
+### APIs externas que consume el sistema
+
+| Proveedor | ¿Qué devuelve? | Clave de búsqueda |
+|---|---|---|
+| **StaFe** | Registro de multas de la provincia de Santa Fe; datos del titular. | Patente |
+| **SIJAI** | Tipo de documento del titular del vehículo (CUIT o DNI). | Patente |
+| **Peype (PYP)** | Datos de contacto del titular: CUIT, DNI, teléfono, email. | CUIT / DNI / Patente |
+| **InfoExpertos** | Detalle del dominio vehicular. API paga con deduplicación contra Oracle. | Patente |
+| **Agildata** | Datos de propiedad del dominio. Cap duro de 1000 llamadas/mes. | Patente |
+| **Córdoba API** | Registro de multas municipales de Córdoba. Implementada como Lambda + Oracle. | Patente |
+| **Berazategui API** | Datos municipales de Berazategui. | Patente |
+| **DGI UY** | Datos de facturación electrónica del organismo tributario uruguayo. | RUT + credenciales |
+
+---
+
+## Estructura del repositorio
+
+```
+foto_multas/
+├── apps/
+│   ├── ecs_processor/          # Procesador on-demand multi-modo (principal entry point)
+│   ├── ecs_dedicated/          # Stage 1: cascade StaFe + SIJAI + Peype
+│   ├── ecs_decoupled/          # Stage 2: cascade Córdoba + Peype + InfoExpertos + Berazategui + Agildata
+│   ├── ecs_gestor/             # Legacy: procesador monolítico (deshabilitado)
+│   ├── ecs_orchestrator_dgi/   # Pipeline DGI Uruguay (independiente)
+│   └── ecs_peype_sftp/         # Enriquecimiento batch vía SFTP con Peype
+│
+├── terraform/                  # Infraestructura AWS (IaC con Terraform)
+│   └── lambda/functions/       # Código fuente de cada función Lambda
+│
+└── docs/
+    └── ai/                     # Documentación de arquitectura para AI y desarrolladores
+        ├── architecture.md     # Referencia canónica de arquitectura
+        ├── services.md         # Detalle de cada servicio ECS
+        ├── data-flow.md        # Walkthrough paso a paso de cada pipeline
+        └── infrastructure.md   # Referencia de infraestructura Terraform
+```
+
+Cada directorio bajo `apps/ecs_*/` es una imagen Docker independiente. Contiene su propio `Dockerfile`, `requirements.txt`, y un árbol de módulos `modules/` con clientes de API, adaptadores de infraestructura y lógica de inserción en Oracle.
+
+---
+
+## Convenciones del proyecto
+
+- **`main.py` / `exec_main.py`**: entry points de ejecución. `main.py` en servicios on-demand; `exec_main.py` en servicios programados.
+- **`modules/apis/`**: clientes HTTP de cada API externa.
+- **`modules/infraestructure/`**: adaptadores de infraestructura (Oracle, S3, DynamoDB, SSM).
+- **`CLOUD_RUN=true`**: modo producción. Escribe en `DATOS_PROD`, actualiza DynamoDB, envía notificaciones SNS.
+- **`CLOUD_RUN=false`**: modo desarrollo. Escribe en `DATOS_CLIENTES`, sin DynamoDB ni SNS.
+
+<Note>
+  La documentación de arquitectura canónica vive en `docs/ai/index.md` dentro del repositorio fuente. Si hay discrepancias entre esta documentación y el código, el código manda.
+</Note>
